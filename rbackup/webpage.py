@@ -1046,20 +1046,22 @@ PAGE_TEMPLATE = r"""<!doctype html>
     return "成功";
   }
 
-  function makeCell(tag, text, className) {
+  // 注意：这里不能叫 makeTable —— 上面渲染对比结果时已经有一个 makeTable，
+  // 同名函数声明会互相覆盖（表现为 titles.forEach is not a function）。
+  function auditCell(tag, text, className) {
     const el = document.createElement(tag);
     if (text !== undefined && text !== null && text !== "") el.textContent = String(text);
     if (className) el.className = className;
     return el;
   }
 
-  function makeTable(titles, rows) {
+  function auditTable(titles, rows) {
     const table = document.createElement("table");
     table.className = "difftable";
     const head = document.createElement("thead");
     const headRow = document.createElement("tr");
     titles.forEach((titleText, index) => {
-      const th = makeCell("th", titleText);
+      const th = auditCell("th", titleText);
       if (index === 0) th.style.width = "120px";
       headRow.appendChild(th);
     });
@@ -1070,7 +1072,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
       const row = document.createElement("tr");
       cells.forEach((item) => {
         if (item instanceof Element) row.appendChild(item);
-        else row.appendChild(makeCell("td", item));
+        else row.appendChild(auditCell("td", item));
       });
       body.appendChild(row);
     });
@@ -1078,7 +1080,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     return table;
   }
 
-  function emptyBox(text) {
+  function auditEmptyBox(text) {
     const box = document.createElement("div");
     box.className = "empty";
     box.textContent = text;
@@ -1098,7 +1100,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     const box = $("audit-body");
     box.textContent = "";
     if (!entries.length) {
-      box.appendChild(emptyBox("还没有记录。执行一次上传、删除、恢复或保存配置后会出现。"));
+      box.appendChild(auditEmptyBox("还没有记录。执行一次上传、删除、恢复或保存配置后会出现。"));
       return;
     }
     const rows = entries.map((entry) => {
@@ -1109,15 +1111,15 @@ PAGE_TEMPLATE = r"""<!doctype html>
       if (entry.version) detail.push("版本 " + entry.version);
       if (entry.error) detail.push(entry.error);
       return [
-        makeCell("td", auditTime(entry.ts), "num"),
-        makeCell("td", OP_LABELS[entry.op] || entry.op),
-        makeCell("td", scope, "path"),
-        makeCell("td", entry.count != null ? entry.count : "", "num"),
-        makeCell("td", auditResult(entry), "num"),
-        makeCell("td", detail.join(" · "), "num"),
+        auditCell("td", auditTime(entry.ts), "num"),
+        auditCell("td", OP_LABELS[entry.op] || entry.op),
+        auditCell("td", scope, "path"),
+        auditCell("td", entry.count != null ? entry.count : "", "num"),
+        auditCell("td", auditResult(entry), "num"),
+        auditCell("td", detail.join(" · "), "num"),
       ];
     });
-    box.appendChild(makeTable(["时间", "操作", "类别", "项数", "结果", "详情"], rows));
+    box.appendChild(auditTable(["时间", "操作", "类别", "项数", "结果", "详情"], rows));
   }
 
   async function restoreConfigBackup(name) {
@@ -1150,7 +1152,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     const box = $("audit-body");
     box.textContent = "";
     if (!backups.length) {
-      box.appendChild(emptyBox("还没有配置备份。每次在页面保存配置都会自动留一份，最多保留 20 份。"));
+      box.appendChild(auditEmptyBox("还没有配置备份。每次在页面保存配置都会自动留一份，最多保留 20 份。"));
       return;
     }
     const rows = backups.map((item) => {
@@ -1159,16 +1161,16 @@ PAGE_TEMPLATE = r"""<!doctype html>
       button.className = "small";
       button.textContent = "恢复";
       button.addEventListener("click", () => restoreConfigBackup(item.name));
-      const actionCell = makeCell("td", "");
+      const actionCell = auditCell("td", "");
       actionCell.appendChild(button);
       return [
-        makeCell("td", item.name, "path"),
-        makeCell("td", item.mtime.replace("T", " ").slice(0, 19), "num"),
-        makeCell("td", formatSize(item.size), "num"),
+        auditCell("td", item.name, "path"),
+        auditCell("td", item.mtime.replace("T", " ").slice(0, 19), "num"),
+        auditCell("td", formatSize(item.size), "num"),
         actionCell,
       ];
     });
-    box.appendChild(makeTable(["备份文件", "时间", "大小", "操作"], rows));
+    box.appendChild(auditTable(["备份文件", "时间", "大小", "操作"], rows));
   }
 
   async function operate(kind) {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -197,6 +198,26 @@ class WebServerTests(unittest.TestCase):
         data = json.loads(body)
         self.assertTrue(data["ok"])
         self.assertIsInstance(data["backups"], list)
+
+    def test_page_has_no_duplicate_function_declarations(self) -> None:
+        """同名函数声明会互相覆盖，曾导致 titles.forEach is not a function。"""
+        from rbackup.webpage import render_page
+
+        page = render_page(self.token)
+        script = re.search(r"<script>(.*?)</script>", page, flags=re.S)
+        self.assertIsNotNone(script)
+        names = re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(", script.group(1))
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        self.assertEqual(duplicates, [], f"页面脚本里有重复函数声明：{duplicates}")
+
+    def test_page_references_only_existing_element_ids(self) -> None:
+        from rbackup.webpage import render_page
+
+        page = render_page(self.token)
+        script = re.search(r"<script>(.*?)</script>", page, flags=re.S).group(1)
+        defined = set(re.findall(r'id="([^"]+)"', page))
+        used = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', script))
+        self.assertEqual(sorted(used - defined), [], "脚本引用了不存在的元素 id")
 
 
 if __name__ == "__main__":
