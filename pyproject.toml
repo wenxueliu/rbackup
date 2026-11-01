@@ -1,22 +1,61 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbackup"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Per-device, encrypted, versioned rclone backups without local indexes"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
-authors = [{ name = "rbackup" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "wenxueliu" }]
+keywords = [
+    "backup",
+    "rclone",
+    "crypt",
+    "encryption",
+    "incremental",
+    "versioning",
+    "cloud",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Security :: Cryptography",
+]
 dependencies = []
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "twine>=5.1"]
+
+[project.urls]
+Homepage = "https://github.com/wenxueliu/rbackup"
+Repository = "https://github.com/wenxueliu/rbackup"
+Documentation = "https://github.com/wenxueliu/rbackup/tree/main/docs"
+Changelog = "https://github.com/wenxueliu/rbackup/commits/main"
 
 [project.scripts]
 rbackup = "rbackup.cli:main"
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 include = ["rbackup*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "rbackup.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

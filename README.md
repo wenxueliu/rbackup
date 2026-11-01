@@ -12,6 +12,42 @@ rbackup 面向“已经有网盘，但不愿把明文交给网盘，也不想为
 | **目的** | 本机上一个交给网盘客户端同步的目录 | 密文当前版本、`_versions`、`_state` |
 | **网盘** | 由网盘客户端负责的云端 | 目的目录的一份同步副本 |
 
+三者的关系，以及目的里为什么还会多出 `_versions`、`_state`：
+
+```mermaid
+flowchart LR
+    subgraph SRC["源：本机明文"]
+        direction TB
+        C1["类别 documents<br/>~/Documents"]
+        C2["类别 photos<br/>~/Pictures"]
+    end
+
+    RB["rbackup<br/>只 copy，不 sync"]
+    CR["rclone crypt<br/>写入时流式加密"]
+
+    subgraph DST["目的：本机同步目录（交给网盘客户端）"]
+        direction TB
+        CUR["device/ 当前密文"]
+        OLD["_versions/device/version/<br/>被覆盖的旧密文"]
+        ST["_state/device/<br/>基线"]
+    end
+
+    CL["网盘同步客户端"]
+    CLOUD[("网盘云端")]
+
+    C1 -->|"读取明文"| RB
+    C2 -->|"读取明文"| RB
+    RB --> CR
+    CR --> CUR
+    CR -.->|"覆盖前移入"| OLD
+    RB -.->|"读基线、判漂移"| ST
+    DST <-->|"双向同步密文"| CL
+    CL <-->|"上传 / 下载"| CLOUD
+    RB -.->|"restore：解密回本地"| SRC
+```
+
+`device/` 是设备前缀，一台设备只写自己那一份；`_versions`、`_state` 同样在目的里，会随目的一起上云。除了 `restore`，没有从目的回到源的反向路径。
+
 全文统一用“源”“目的”指代两端。目的目录本身在本地，只是它的内容会被同步上云。
 
 **它不做什么**：不合并冲突、不传播删除、不做块级去重、不替代网盘客户端。
@@ -25,7 +61,21 @@ rbackup 面向“已经有网盘，但不愿把明文交给网盘，也不想为
 
 ## 安装
 
-需要 Python 3.11+ 和 rclone（`rclone` 在 PATH 上，或在配置里给绝对路径）。
+需要 Python **3.11+** 和 **rclone**。rbackup 不捆绑 rclone，请先自己装好：
+
+- 从 <https://rclone.org/install/> 下载并安装（Windows 解压即用，macOS 用 Homebrew 或脚本，Linux 用脚本或包管理器）；
+- 装完运行 `rclone version` 确认可用，并保证 `rclone` 在 `PATH` 上；不在 `PATH` 上时，在配置里给 `rclone_bin` 写绝对路径。
+
+然后安装 rbackup 本体：
+
+```bash
+pip install rbackup             # 从 PyPI 安装
+python -m pip install -U rbackup   # 升级
+```
+
+项目页：<https://pypi.org/project/rbackup/>。
+
+从源码开发时：
 
 ```bash
 pip install -e .        # 安装后可用 rbackup 命令
