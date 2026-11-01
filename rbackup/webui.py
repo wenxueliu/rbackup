@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -77,6 +78,24 @@ class WebState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     mutation_lock: threading.Lock = field(default_factory=threading.Lock)
     port: int = 0
+    progress_lock: threading.Lock = field(default_factory=threading.Lock)
+    progress: dict[str, Any] = field(
+        default_factory=lambda: {
+            "active": False,
+            "op": "",
+            "label": "",
+            "index": 0,
+            "total": 0,
+            "path": "",
+            "percent": 0,
+            "bytes": 0,
+            "total_bytes": 0,
+            "speed": None,
+            "eta": None,
+            "overall": 0,
+            "error": None,
+        }
+    )
 
     @classmethod
     def create(cls, config_path: Path, token: str) -> "WebState":
@@ -153,6 +172,70 @@ class WebState:
             )
             return result
 
+    # --- 进度 ---------------------------------------------------------
+
+    def progress_snapshot(self) -> dict[str, Any]:
+        with self.progress_lock:
+            data = dict(self.progress)
+        started = data.pop("started_at", None)
+        data["elapsed"] = (
+            round(time.monotonic() - started, 1) if started is not None else 0.0
+        )
+        data["ok"] = True
+        return data
+
+    def _progress_begin(self, op: str, label: str) -> None:
+        with self.progress_lock:
+            self.progress = {
+                "active": True,
+                "op": op,
+                "label": label,
+                "index": 0,
+                "total": 0,
+                "path": "",
+                "percent": 0,
+                "bytes": 0,
+                "total_bytes": 0,
+                "speed": None,
+                "eta": None,
+                "overall": 0,
+                "error": None,
+                "started_at": time.monotonic(),
+            }
+
+    def _progress_event(self, info: dict[str, Any]) -> None:
+        with self.progress_lock:
+            data = self.progress
+            if info.get("index"):
+                data["index"] = int(info["index"])
+            if info.get("total"):
+                data["total"] = int(info["total"])
+            if info.get("path"):
+                data["path"] = str(info["path"])
+            if info.get("percent") is not None:
+                data["percent"] = int(info["percent"])
+            for key in ("bytes", "total_bytes", "speed", "eta"):
+                if info.get(key) is not None:
+                    data[key] = info[key]
+            total = int(data["total"] or 0)
+            index = int(data["index"] or 0)
+            percent = int(data["percent"] or 0)
+            if total > 0 and index > 0:
+                finished = index - 1
+                data["overall"] = max(
+                    0, min(100, int(((finished + percent / 100.0) / total) * 100))
+                )
+            else:
+                data["overall"] = max(0, min(100, percent))
+
+    def _progress_end(self, error: str | None = None) -> None:
+        with self.progress_lock:
+            self.progress["active"] = False
+            self.progress["error"] = error
+            if error is None:
+                self.progress["percent"] = 100
+                self.progress["overall"] = 100
+
     # --- A/B 对比与写操作 ---------------------------------------------
 
     def _app(self, payload: dict[str, Any]) -> App:
@@ -165,10 +248,27 @@ class WebState:
         self, payload: dict[str, Any], category: Any, paths: Any, dry_run: Any = False
     ) -> dict[str, Any]:
         app = self._app(payload)
+        name = _category_name(category)
         with self.mutation_lock:
-            return webfiles.upload_paths(
-                app, _category_name(category), paths, dry_run=_flag(dry_run)
-            )
+            self._progress_begin("upload", f"上传到 B · {name}")
+            failure: str | None = None
+            try:
+                result = webfiles.upload_paths(
+                    app,
+                    name,
+                    paths,
+                    dry_run=_flag(dry_run),
+                    on_progress=self._progress_event,
+                )
+            except RbackupError as exc:
+                failure = str(exc)
+                raise
+            else:
+                if result.get("failed"):
+                    failure = f"{result['failed']} 项失败，详见结果"
+                return result
+            finally:
+                self._progress_end(failure)
 
     def remove(
         self, payload: dict[str, Any], category: Any, paths: Any, dry_run: Any = False
@@ -348,6 +448,11 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                 if not self._auth():
                     return
                 self._send_json(200, state.snapshot())
+                return
+            if parsed.path == "/api/progress":
+                if not self._auth():
+                    return
+                self._send_json(200, state.progress_snapshot())
                 return
             self._send_json(404, {"ok": False, "error": "not found"})
 

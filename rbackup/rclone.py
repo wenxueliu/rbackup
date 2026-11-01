@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
+import threading
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from .config import Config
 from .errors import RbackupError
@@ -14,6 +16,48 @@ from .errors import RbackupError
 log = logging.getLogger(__name__)
 
 MISSING_REMOTE_CODES = {3, 4}
+
+# rclone 的 --stats-one-line 形如：
+#   12.345 MiB / 41.454 MiB, 30%, 6.005 MiB/s, ETA 5s
+# 注意：写进管道时各段之间没有任何分隔符，是首尾相接的，所以用正则逐段抽取。
+_PROGRESS_RE = re.compile(
+    r"([\d.]+)\s+([KMGTP]?i?B)\s*/\s*([\d.]+)\s+([KMGTP]?i?B)\s*,\s*(\d+)%"
+    r"(?:\s*,\s*([\d.]+)\s+([KMGTP]?i?B)/s)?"
+    # ETA 只会是 5s / 1m30s 这类时长；用 \S+ 会把下一段的开头数字一起吞掉
+    r"(?:\s*,\s*ETA\s+(-|(?:\d+\.?\d*[dhms])+))?"
+)
+_UNIT_BYTES = {
+    "B": 1,
+    "KiB": 1024,
+    "MiB": 1024**2,
+    "GiB": 1024**3,
+    "TiB": 1024**4,
+    "PiB": 1024**5,
+}
+
+
+def _to_bytes(value: str, unit: str) -> float:
+    return float(value) * _UNIT_BYTES.get(unit, 1)
+
+
+def parse_progress(text: str) -> dict[str, Any] | None:
+    """从 rclone 的 stats 文本里取最后一段进度；取不到返回 None。"""
+    last = None
+    for match in _PROGRESS_RE.finditer(text):
+        last = match
+    if last is None:
+        return None
+    speed = None
+    if last.group(6) is not None:
+        speed = _to_bytes(last.group(6), last.group(7))
+    return {
+        "percent": int(last.group(5)),
+        "bytes": _to_bytes(last.group(1), last.group(2)),
+        "total_bytes": _to_bytes(last.group(3), last.group(4)),
+        "speed": speed,
+        "eta": last.group(8) if last.group(8) not in (None, "-") else None,
+    }
+
 
 
 class RcloneError(RbackupError):
@@ -91,12 +135,22 @@ class Rclone:
             args.append("--links")
         return args
 
-    def _argv(self, args: Sequence[str], *, stats: bool = False) -> list[str]:
+    def _argv(
+        self,
+        args: Sequence[str],
+        *,
+        stats: bool = False,
+        stats_interval: str = "5s",
+        progress: bool = False,
+    ) -> list[str]:
         argv = [self.binary, *self._global_args()]
         if stats:
-            argv.extend(["--stats-one-line", "--stats", "5s"])
+            argv.extend(["--stats-one-line", "--stats", stats_interval])
         else:
             argv.extend(["--stats", "0"])
+        if progress:
+            # 输出被重定向时 rclone 默认不刷进度，--progress 强制持续输出
+            argv.append("--progress")
         argv.extend(args)
         return argv
 
@@ -171,6 +225,104 @@ class Rclone:
                 returncode=result.returncode,
                 stdout=result.stdout,
                 stderr=result.stderr,
+            )
+        return result
+
+    def run_with_progress(
+        self,
+        args: Sequence[str],
+        *,
+        on_progress: Callable[[dict[str, Any]], None],
+        timeout: float | None = None,
+        interval: str = "500ms",
+        check: bool = True,
+    ) -> RcloneResult:
+        """运行 rclone，并把 stats 进度实时回调出去。
+
+        与 ``stream=True`` 的区别：stdout 由本程序接管用来解析进度，不再丢给终端，
+        因此网页端能拿到百分比；stderr 仍然被收集，用于失败时展示原因。
+        """
+        argv = self._argv(args, stats=True, stats_interval=interval, progress=True)
+        log.debug("rclone: %s", shlex.join(argv))
+        env = os.environ.copy()
+        env.setdefault("RCLONE_ASK_PASSWORD", "false")
+
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise RcloneError(
+                f"找不到 rclone 可执行文件：{self.binary!r}。"
+                "请安装 rclone，或在配置中设置 rclone_bin。",
+                argv=argv,
+            ) from exc
+
+        state = {"timed_out": False}
+
+        def _watchdog() -> None:
+            if proc.poll() is None:
+                state["timed_out"] = True
+                proc.kill()
+
+        timer = None
+        if timeout is not None:
+            timer = threading.Timer(timeout, _watchdog)
+            timer.daemon = True
+            timer.start()
+
+        stderr_chunks: list[bytes] = []
+
+        def _drain_stderr() -> None:
+            try:
+                stderr_chunks.append(proc.stderr.read() or b"")
+            except Exception:  # 进程被强杀时管道可能已关闭
+                log.debug("读取 rclone stderr 失败", exc_info=True)
+
+        drainer = threading.Thread(target=_drain_stderr, daemon=True)
+        drainer.start()
+
+        buffer = ""
+        try:
+            assert proc.stdout is not None
+            while True:
+                # read1 有数据就返回，不会等满缓冲区，进度才够及时
+                chunk = proc.stdout.read1(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="replace")
+                if len(buffer) > 16384:
+                    buffer = buffer[-8192:]
+                info = parse_progress(buffer)
+                if info is not None:
+                    try:
+                        on_progress(info)
+                    except Exception:  # 回调出错不能影响传输
+                        log.debug("进度回调异常", exc_info=True)
+        finally:
+            if timer is not None:
+                timer.cancel()
+            proc.wait()
+            drainer.join(timeout=5)
+
+        stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        if state["timed_out"]:
+            raise RcloneError(
+                f"rclone 超时（{timeout} 秒）：{shlex.join(argv)}", argv=argv
+            )
+        result = RcloneResult(argv, proc.returncode, "", stderr_text)
+        if check and not result.ok:
+            details = _tail(stderr_text)
+            raise RcloneError(
+                f"rclone 失败（退出码 {result.returncode}）：{shlex.join(argv)}"
+                + (f"\n{details}" if details else "\n（rclone 输出见上方）"),
+                argv=argv,
+                returncode=result.returncode,
+                stderr=stderr_text,
             )
         return result
 
@@ -320,6 +472,7 @@ class Rclone:
         filters: Iterable[str] = (),
         create_empty_dirs: bool = True,
         timeout: float | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         args = ["copy"]
         if backup_dir:
@@ -331,7 +484,10 @@ class Rclone:
         for pattern in filters:
             args.append(f"--exclude={pattern}")
         args.extend([source, destination])
-        self.run(args, timeout=timeout, stream=True, stats=True)
+        if on_progress is not None:
+            self.run_with_progress(args, on_progress=on_progress, timeout=timeout)
+        else:
+            self.run(args, timeout=timeout, stream=True, stats=True)
 
     def copyto(
         self,
@@ -341,6 +497,7 @@ class Rclone:
         backup_dir: str | None = None,
         dry_run: bool = False,
         timeout: float | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         args = ["copyto"]
         if backup_dir:
@@ -348,7 +505,10 @@ class Rclone:
         if dry_run:
             args.append("--dry-run")
         args.extend([source, destination])
-        self.run(args, timeout=timeout, stream=True, stats=True)
+        if on_progress is not None:
+            self.run_with_progress(args, on_progress=on_progress, timeout=timeout)
+        else:
+            self.run(args, timeout=timeout, stream=True, stats=True)
 
     def cryptcheck(
         self,

@@ -9,7 +9,7 @@ from __future__ import annotations
 import shutil
 import socket
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .app import App, select_categories
 from .errors import UsageError
@@ -189,8 +189,13 @@ def upload_paths(
     paths: Any,
     *,
     dry_run: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """把 A 中的文件或文件夹上传到 B 的当前版本，旧内容进 _versions。"""
+    """把 A 中的文件或文件夹上传到 B 的当前版本，旧内容进 _versions。
+
+    ``on_progress`` 会收到两类事件：``item``/``item_done``（第几项，共几项）
+    和 ``bytes``（rclone 的实时字节进度）。
+    """
     category = app.config.category(category_name)
     if not category.enabled:
         raise UsageError(f"类别 {category_name!r} 已禁用，请先启用")
@@ -201,14 +206,25 @@ def upload_paths(
     version_id = new_version_id()
     version_root = app.layout.version_category(version_id, category_name)
     destination_root = app.layout.category_root(category_name)
+    total_items = len(cleaned)
+
+    def emit(**info: Any) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(info)
+        except Exception:  # 进度回调不应影响上传
+            pass
 
     results: list[dict[str, Any]] = []
-    for relpath in cleaned:
+    for position, relpath in enumerate(cleaned, start=1):
+        emit(event="item", index=position, total=total_items, path=relpath, percent=0)
         source = category.path / PurePosixPath(relpath)
         if not source.exists():
             results.append(
                 {"path": relpath, "ok": False, "error": "A 中不存在该路径"}
             )
+            emit(event="item_done", index=position, total=total_items, path=relpath, ok=False)
             continue
         is_dir = source.is_dir()
         parent = PurePosixPath(relpath).parent
@@ -216,6 +232,20 @@ def upload_paths(
         # 让旧版本落到 _versions/<vid>/<类别>/<原始相对目录>，与 backup 的布局一致
         backup_dir = version_root + (f"/{parent_text}" if parent_text else "")
         destination = f"{destination_root}/{relpath}"
+
+        def byte_progress(info: dict[str, Any], _pos: int = position) -> None:
+            emit(
+                event="bytes",
+                index=_pos,
+                total=total_items,
+                path=relpath,
+                percent=int(info.get("percent") or 0),
+                bytes=info.get("bytes"),
+                total_bytes=info.get("total_bytes"),
+                speed=info.get("speed"),
+                eta=info.get("eta"),
+            )
+
         try:
             if is_dir:
                 app.rclone.copy(
@@ -225,6 +255,7 @@ def upload_paths(
                     dry_run=dry_run,
                     filters=category.excludes,
                     create_empty_dirs=app.config.create_empty_dirs,
+                    on_progress=byte_progress,
                 )
             else:
                 app.rclone.copyto(
@@ -232,6 +263,7 @@ def upload_paths(
                     destination,
                     backup_dir=backup_dir,
                     dry_run=dry_run,
+                    on_progress=byte_progress,
                 )
         except RcloneError as exc:
             results.append(
@@ -242,9 +274,18 @@ def upload_paths(
                     "error": str(exc)[:2000],
                 }
             )
+            emit(event="item_done", index=position, total=total_items, path=relpath, ok=False)
             continue
         results.append(
             {"path": relpath, "ok": True, "kind": "dir" if is_dir else "file"}
+        )
+        emit(
+            event="item_done",
+            index=position,
+            total=total_items,
+            path=relpath,
+            ok=True,
+            percent=100,
         )
 
     uploaded = sum(1 for item in results if item["ok"])

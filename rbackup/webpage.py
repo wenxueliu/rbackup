@@ -158,6 +158,15 @@ PAGE_TEMPLATE = r"""<!doctype html>
   .group-title { display: flex; align-items: baseline; gap: 8px; margin: 16px 0 8px; font-size: 13px; font-weight: 700; color: var(--muted); }
   .cat-block + .cat-block { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
   .empty { padding: 22px; text-align: center; color: var(--muted); font-size: 13px; border: 1px dashed var(--line); border-radius: 11px; }
+  .progress { margin: 0 0 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--soft); }
+  .progress-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+  .progress-pct { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 700; }
+  .progress-track { height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .progress-fill { height: 100%; width: 0; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--ok)); transition: width .25s ease; }
+  .progress-fill.pulse { animation: progress-pulse 1.4s ease-in-out infinite; }
+  @keyframes progress-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  .progress-fill.failed { background: var(--err); }
+  .progress-detail { margin-top: 7px; font-variant-numeric: tabular-nums; }
   .result-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--muted); }
   @media (max-width: 780px) {
     .hero { display: block; }
@@ -305,6 +314,16 @@ PAGE_TEMPLATE = r"""<!doctype html>
       <label class="checkline"><input id="dry-run" type="checkbox"> 仅预演</label>
     </div>
     <div id="diff-summary" class="tiny muted" style="margin-bottom:12px">尚未对比。</div>
+    <div id="progress" class="progress" hidden>
+      <div class="progress-head">
+        <span id="progress-label">准备中…</span>
+        <span id="progress-pct" class="progress-pct">0%</span>
+      </div>
+      <div class="progress-track">
+        <div id="progress-bar" class="progress-fill" style="width:0%"></div>
+      </div>
+      <div id="progress-detail" class="tiny muted"></div>
+    </div>
     <div class="toolbar" id="diff-toolbar" hidden>
       <label class="checkline"><input id="select-all" type="checkbox"> 全选</label>
       <span id="selection-count" class="tiny muted">已选 0 项</span>
@@ -901,6 +920,78 @@ PAGE_TEMPLATE = r"""<!doctype html>
     renderDiff(data);
   }
 
+  // ---------- 进度 ----------
+  function formatBytes(value) {
+    const num = Number(value) || 0;
+    if (num <= 0) return "0 B";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let index = 0;
+    let size = num;
+    while (size >= 1024 && index < units.length - 1) {
+      size /= 1024;
+      index += 1;
+    }
+    return (index === 0 ? size.toFixed(0) : size.toFixed(1)) + " " + units[index];
+  }
+
+  let progressTimer = null;
+
+  function renderProgress(info) {
+    const box = $("progress");
+    const bar = $("progress-bar");
+    const overall = Math.max(0, Math.min(100, Math.round(info.overall || 0)));
+    box.hidden = false;
+    bar.style.width = overall + "%";
+    $("progress-pct").textContent = overall + "%";
+    $("progress-label").textContent = info.label || "处理中…";
+
+    const parts = [];
+    if (info.total > 0) parts.push(info.index + " / " + info.total + " 项");
+    if (info.path) parts.push(info.path);
+    if (info.total_bytes > 0) {
+      parts.push(formatBytes(info.bytes) + " / " + formatBytes(info.total_bytes));
+    }
+    if (info.speed) parts.push(formatBytes(info.speed) + "/s");
+    if (info.eta) parts.push("剩余 " + info.eta);
+    if (info.elapsed) parts.push("已用 " + info.elapsed + "s");
+    $("progress-detail").textContent = parts.join(" · ");
+
+    // 没有字节进度（如预演、目录扫描）时用脉冲提示仍在进行
+    bar.classList.toggle("pulse", !info.total_bytes);
+  }
+
+  async function pollProgress() {
+    try {
+      const info = await api("/api/progress", { method: "GET" });
+      if (info.active) renderProgress(info);
+      else if (info.error) {
+        renderProgress({ ...info, label: "失败：" + info.error });
+        $("progress-bar").classList.add("failed");
+      }
+    } catch (err) {
+      /* 轮询失败不打断主请求 */
+    }
+  }
+
+  function startProgress() {
+    const bar = $("progress-bar");
+    bar.classList.remove("failed");
+    bar.style.width = "0%";
+    $("progress").hidden = false;
+    $("progress-label").textContent = "正在上传…";
+    $("progress-detail").textContent = "";
+    if (progressTimer) clearInterval(progressTimer);
+    progressTimer = setInterval(pollProgress, 400);
+    pollProgress();
+  }
+
+  function stopProgress() {
+    if (progressTimer) {
+      clearInterval(progressTimer);
+      progressTimer = null;
+    }
+  }
+
   async function operate(kind) {
     const category = $("browse-category").value;
     if (!category) {
@@ -927,15 +1018,25 @@ PAGE_TEMPLATE = r"""<!doctype html>
     }
 
     const endpoint = isUpload ? "/api/upload" : (isLocal ? "/api/delete-local" : "/api/delete");
-    const data = await api(endpoint, {
-      method: "POST",
-      body: JSON.stringify({
-        payload: collect(),
-        category,
-        paths: rows.map((row) => row.path),
-        dry_run: dry,
-      }),
-    });
+    if (isUpload) startProgress();
+    let data;
+    try {
+      data = await api(endpoint, {
+        method: "POST",
+        body: JSON.stringify({
+          payload: collect(),
+          category,
+          paths: rows.map((row) => row.path),
+          dry_run: dry,
+        }),
+      });
+    } finally {
+      if (isUpload) {
+        stopProgress();
+        await pollProgress();
+        setTimeout(() => { $("progress").hidden = true; }, 1200);
+      }
+    }
     const done = (isUpload ? data.uploaded : data.deleted) || 0;
     const failures = (data.results || []).filter((item) => !item.ok);
     const verb = isUpload ? "上传" : (isLocal ? "从 A 删除" : "从 B 删除");

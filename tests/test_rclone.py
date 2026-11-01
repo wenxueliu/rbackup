@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rbackup.config import Category, Config
-from rbackup.rclone import Rclone, RcloneError
+from rbackup.rclone import Rclone, RcloneError, parse_progress
 
 
 def make_config(**overrides: object) -> Config:
@@ -94,6 +94,73 @@ class RcloneCommandTests(unittest.TestCase):
             [], 0, b'{"Path":"a.txt","Size":3,"IsDir":false}', b""
         )
         self.assertEqual(rclone.stat("crypt:dev/docs/a.txt")["Size"], 3)
+
+
+class ProgressParseTests(unittest.TestCase):
+    def test_parses_percent_bytes_speed_eta(self) -> None:
+        info = parse_progress("12.345 MiB / 41.454 MiB, 30%, 6.005 MiB/s, ETA 5s")
+        self.assertIsNotNone(info)
+        self.assertEqual(info["percent"], 30)
+        self.assertAlmostEqual(info["total_bytes"], 41.454 * 1024**2, places=2)
+        self.assertAlmostEqual(info["speed"], 6.005 * 1024**2, places=2)
+        self.assertEqual(info["eta"], "5s")
+
+    def test_handles_concatenated_segments(self) -> None:
+        """rclone 写管道时各段之间没有分隔符，必须取最后一段。"""
+        text = (
+            "7.059 MiB / 41.454 MiB, 17%, 0 B/s, ETA -"
+            "14.059 MiB / 41.454 MiB, 34%, 10.059 MiB/s, ETA 2s"
+            "41.454 MiB / 41.454 MiB, 100%, 10.015 MiB/s, ETA 0s"
+        )
+        info = parse_progress(text)
+        self.assertEqual(info["percent"], 100)
+
+    def test_done_without_eta_has_no_eta(self) -> None:
+        info = parse_progress("41.454 MiB / 41.454 MiB, 100%, 0 B/s, ETA -")
+        self.assertEqual(info["percent"], 100)
+        self.assertIsNone(info["eta"])
+
+    def test_returns_none_without_progress(self) -> None:
+        self.assertIsNone(parse_progress("2026/01/01 NOTICE: something happened"))
+
+    @patch("rbackup.rclone.subprocess.Popen")
+    def test_copyto_streams_progress_to_callback(self, popen) -> None:
+        class FakeStdout:
+            def __init__(self) -> None:
+                self.chunks = [
+                    b"5.000 MiB / 10.000 MiB, 50%, 2.000 MiB/s, ETA 2s",
+                    b"10.000 MiB / 10.000 MiB, 100%, 2.000 MiB/s, ETA 0s",
+                    b"",
+                ]
+
+            def read1(self, _size: int) -> bytes:
+                return self.chunks.pop(0) if self.chunks else b""
+
+        class FakeStderr:
+            def read(self) -> bytes:
+                return b""
+
+        class FakeProc:
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.stdout = FakeStdout()
+                self.stderr = FakeStderr()
+
+            def poll(self):
+                return 0
+
+            def wait(self) -> int:
+                return 0
+
+            def kill(self) -> None:
+                pass
+
+        popen.return_value = FakeProc()
+        seen: list[int] = []
+        rclone = Rclone(make_config())
+        rclone.copyto("C:/docs/a.bin", "crypt:dev/docs/a.bin", on_progress=lambda i: seen.append(i["percent"]))
+        self.assertEqual(seen, [50, 100])
 
 
 if __name__ == "__main__":

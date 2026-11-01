@@ -282,6 +282,35 @@ enabled = true
         self.assertEqual(result["failed"], 1, result)
         self.assertTrue(victim.exists())
 
+    # ---------- 进度 ----------
+
+    def test_upload_emits_progress_events(self) -> None:
+        events = []
+        webfiles.upload_paths(
+            self.fresh_app(),
+            "docs",
+            ["a.txt"],
+            on_progress=lambda info: events.append(info),
+        )
+        kinds = [event["event"] for event in events]
+        self.assertIn("item", kinds)
+        self.assertIn("item_done", kinds)
+        start = events[0]
+        self.assertEqual(start["index"], 1)
+        self.assertEqual(start["total"], 1)
+        self.assertEqual(start["path"], "a.txt")
+        self.assertTrue(events[-1]["ok"])
+
+    def test_upload_progress_reports_failure(self) -> None:
+        events = []
+        webfiles.upload_paths(
+            self.fresh_app(),
+            "docs",
+            ["nope.txt"],
+            on_progress=lambda info: events.append(info),
+        )
+        self.assertFalse(events[-1]["ok"])
+
     # ---------- 基线 ----------
 
     def test_rebaseline_clears_drift(self) -> None:

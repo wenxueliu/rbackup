@@ -160,6 +160,20 @@ class WebServerTests(unittest.TestCase):
             self.assertNotEqual(status, 404, f"{path} 未注册：{body}")
             self.assertFalse(json.loads(body)["ok"], body)
 
+    def test_progress_endpoint_is_idle_initially(self) -> None:
+        status, body, _content_type = self.request(
+            "/api/progress", method="GET", token=self.token
+        )
+        self.assertEqual(status, 200, body)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["active"])
+        self.assertEqual(data["overall"], 0)
+
+    def test_progress_endpoint_requires_token(self) -> None:
+        status, _body, _content_type = self.request("/api/progress", method="GET")
+        self.assertEqual(status, 403)
+
 
 if __name__ == "__main__":
     unittest.main()
