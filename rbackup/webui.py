@@ -288,6 +288,38 @@ class WebState:
                 app, _category_name(category), paths, dry_run=_flag(dry_run)
             )
 
+    def restore(
+        self,
+        payload: dict[str, Any],
+        category: Any,
+        paths: Any,
+        dry_run: Any = False,
+        overwrite: Any = False,
+    ) -> dict[str, Any]:
+        app = self._app(payload)
+        name = _category_name(category)
+        with self.mutation_lock:
+            self._progress_begin("restore", f"恢复到 A · {name}")
+            failure: str | None = None
+            try:
+                result = webfiles.restore_paths(
+                    app,
+                    name,
+                    paths,
+                    dry_run=_flag(dry_run),
+                    overwrite=_flag(overwrite),
+                    on_progress=self._progress_event,
+                )
+            except RbackupError as exc:
+                failure = str(exc)
+                raise
+            else:
+                if result.get("failed"):
+                    failure = f"{result['failed']} 项失败，详见结果"
+                return result
+            finally:
+                self._progress_end(failure)
+
     def rebaseline(self, payload: dict[str, Any], names: Any = None) -> dict[str, Any]:
         app = self._app(payload)
         with self.mutation_lock:
@@ -563,6 +595,18 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                             body.get("category"),
                             body.get("paths"),
                             body.get("dry_run", False),
+                        ),
+                    )
+                    return
+                if parsed.path == "/api/restore":
+                    self._send_json(
+                        200,
+                        state.restore(
+                            self._payload_from(body),
+                            body.get("category"),
+                            body.get("paths"),
+                            body.get("dry_run", False),
+                            body.get("overwrite", False),
                         ),
                     )
                     return

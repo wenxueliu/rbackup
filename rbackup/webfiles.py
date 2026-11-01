@@ -446,6 +446,157 @@ def delete_local_paths(
     }
 
 
+def restore_paths(
+    app: App,
+    category_name: str,
+    paths: Any,
+    *,
+    dry_run: bool = False,
+    overwrite: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """把 B 当前版本中的文件或文件夹恢复到 A。
+
+    默认不覆盖 A 中已存在的路径（``overwrite=True`` 才覆盖），避免误用旧备份
+    盖掉本地较新的文件。只写 A，不改 B，因此不会让基线漂移。
+    """
+    category = app.config.category(category_name)
+    if not category.enabled:
+        raise UsageError(f"类别 {category_name!r} 已禁用，请先启用")
+
+    cleaned = clean_paths(paths)
+    root = category.path.resolve()
+    total_items = len(cleaned)
+
+    def emit(**info: Any) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(info)
+        except Exception:
+            pass
+
+    results: list[dict[str, Any]] = []
+    for position, relpath in enumerate(cleaned, start=1):
+        emit(event="item", index=position, total=total_items, path=relpath, percent=0)
+        remote = app.layout.category_file(category_name, relpath)
+        try:
+            info = app.rclone.stat(remote)
+        except RcloneError as exc:
+            results.append(
+                {
+                    "path": relpath,
+                    "ok": False,
+                    "error": f"无法读取 B 中的路径：{str(exc)[:1000]}",
+                }
+            )
+            emit(event="item_done", index=position, total=total_items, path=relpath, ok=False)
+            continue
+        if info is None:
+            results.append({"path": relpath, "ok": False, "error": "B 中不存在该路径"})
+            emit(event="item_done", index=position, total=total_items, path=relpath, ok=False)
+            continue
+
+        is_dir = bool(info.get("IsDir"))
+        target = category.path / PurePosixPath(relpath)
+        target_exists = target.exists() or target.is_symlink()
+
+        try:
+            parent_ok = root in target.parent.resolve(strict=False).parents or (
+                target.parent.resolve(strict=False) == root
+            )
+        except OSError:
+            parent_ok = False
+        if not parent_ok:
+            results.append(
+                {
+                    "path": relpath,
+                    "ok": False,
+                    "error": "目标路径不在 A 目录内，已拒绝",
+                }
+            )
+            emit(event="item_done", index=position, total=total_items, path=relpath, ok=False)
+            continue
+
+        if target_exists and not overwrite:
+            results.append(
+                {
+                    "path": relpath,
+                    "ok": False,
+                    "kind": "dir" if is_dir else "file",
+                    "error": "A 中已存在该路径；如需覆盖请勾选“覆盖 A 中已有”",
+                }
+            )
+            emit(event="item_done", index=position, total=total_items, path=relpath, ok=False)
+            continue
+
+        def byte_progress(data: dict[str, Any], _pos: int = position) -> None:
+            emit(
+                event="bytes",
+                index=_pos,
+                total=total_items,
+                path=relpath,
+                percent=int(data.get("percent") or 0),
+                bytes=data.get("bytes"),
+                total_bytes=data.get("total_bytes"),
+                speed=data.get("speed"),
+                eta=data.get("eta"),
+            )
+
+        try:
+            if not dry_run:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            if is_dir:
+                app.rclone.copy(
+                    remote,
+                    str(target),
+                    dry_run=dry_run,
+                    create_empty_dirs=app.config.create_empty_dirs,
+                    on_progress=byte_progress,
+                )
+            else:
+                app.rclone.copyto(
+                    remote,
+                    str(target),
+                    dry_run=dry_run,
+                    on_progress=byte_progress,
+                )
+        except RcloneError as exc:
+            results.append(
+                {
+                    "path": relpath,
+                    "ok": False,
+                    "kind": "dir" if is_dir else "file",
+                    "error": str(exc)[:2000],
+                }
+            )
+            emit(event="item_done", index=position, total=total_items, path=relpath, ok=False)
+            continue
+        results.append(
+            {"path": relpath, "ok": True, "kind": "dir" if is_dir else "file"}
+        )
+        emit(
+            event="item_done",
+            index=position,
+            total=total_items,
+            path=relpath,
+            ok=True,
+            percent=100,
+        )
+
+    restored = sum(1 for item in results if item["ok"])
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "category": category_name,
+        "results": results,
+        "restored": restored,
+        "failed": len(results) - restored,
+        # 只动 A，基线仍然有效
+        "state_stale": False,
+    }
+
+
 def rebaseline(
     app: App, names: list[str] | tuple[str, ...] | None = None
 ) -> dict[str, Any]:

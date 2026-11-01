@@ -298,7 +298,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
         <p>
           A（明文）与 B（当前版本）逐项对比。上传会把被覆盖的旧内容留在
           <code>_versions</code>；“从 B 删除”会同步到云端且不留版本；
-          “从 A 删除”只动本机明文，B 中的备份仍然保留。文件和文件夹都支持。
+          “从 A 删除”只动本机明文，B 中的备份仍然保留；
+          “从 B 恢复到 A”把选中的项写回本机。文件和文件夹都支持。
         </p>
       </div>
     </div>
@@ -331,6 +332,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
       <button id="upload-selected" type="button" class="small primary">上传到 B</button>
       <button id="delete-selected" type="button" class="small danger">从 B 删除</button>
       <button id="delete-local-selected" type="button" class="small danger">从 A 删除</button>
+      <button id="restore-selected" type="button" class="small primary">从 B 恢复到 A</button>
+      <label class="checkline"><input id="overwrite-restore" type="checkbox"> 覆盖 A 中已有</label>
       <button id="rebaseline" type="button" class="small">重设基线</button>
     </div>
     <div id="diff-body"></div>
@@ -405,7 +408,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
     busy = value;
     ["reload", "check", "save", "refresh-remotes", "inspect-remote", "add-category",
      "load-diff", "run-backup", "upload-selected", "delete-selected",
-     "delete-local-selected", "rebaseline", "force-backup"].forEach((id) => {
+     "delete-local-selected", "restore-selected", "overwrite-restore",
+     "rebaseline", "force-backup"].forEach((id) => {
       const el = $(id);
       if (el) el.disabled = value;
     });
@@ -1006,41 +1010,66 @@ PAGE_TEMPLATE = r"""<!doctype html>
     const dry = $("dry-run").checked;
     const isUpload = kind === "upload";
     const isLocal = kind === "delete-local";
+    const isRestore = kind === "restore";
+    const overwrite = isRestore && $("overwrite-restore").checked;
+    const hasProgress = isUpload || isRestore;
 
     if (!isUpload && !dry) {
-      const message = isLocal
-        ? "确定从 A（明文源）删除选中的 " + rows.length + " 项？\n\n" +
+      let message;
+      if (isRestore) {
+        message = "确定把选中的 " + rows.length + " 项从 B 恢复到 A？\n\n" +
+          (overwrite
+            ? "已勾选“覆盖 A 中已有”：A 中同名文件会被 B 的版本替换，本地较新的改动会丢失。"
+            : "A 中已存在的路径会被跳过，只有缺失的才会补回来。");
+      } else if (isLocal) {
+        message = "确定从 A（明文源）删除选中的 " + rows.length + " 项？\n\n" +
           "只删本机文件，B 中的备份不受影响，之后仍可恢复。\n" +
-          "被删除的内容不会进入任何回收站。"
-        : "确定从 B 删除选中的 " + rows.length + " 项？\n\n" +
+          "被删除的内容不会进入任何回收站。";
+      } else {
+        message = "确定从 B 删除选中的 " + rows.length + " 项？\n\n" +
           "删除会随网盘客户端同步到云端，且不会进入 _versions。";
+      }
       if (!confirm(message)) return;
     }
 
-    const endpoint = isUpload ? "/api/upload" : (isLocal ? "/api/delete-local" : "/api/delete");
-    if (isUpload) startProgress();
+    const endpoints = {
+      upload: "/api/upload",
+      "delete-local": "/api/delete-local",
+      delete: "/api/delete",
+      restore: "/api/restore",
+    };
+    const payload = {
+      payload: collect(),
+      category,
+      paths: rows.map((row) => row.path),
+      dry_run: dry,
+    };
+    if (isRestore) payload.overwrite = overwrite;
+
+    if (hasProgress) startProgress();
     let data;
     try {
-      data = await api(endpoint, {
+      data = await api(endpoints[kind], {
         method: "POST",
-        body: JSON.stringify({
-          payload: collect(),
-          category,
-          paths: rows.map((row) => row.path),
-          dry_run: dry,
-        }),
+        body: JSON.stringify(payload),
       });
     } finally {
-      if (isUpload) {
+      if (hasProgress) {
         stopProgress();
         await pollProgress();
         setTimeout(() => { $("progress").hidden = true; }, 1200);
       }
     }
-    const done = (isUpload ? data.uploaded : data.deleted) || 0;
+    const counts = { upload: "uploaded", restore: "restored" };
+    const done = data[counts[kind] || "deleted"] || 0;
     const failures = (data.results || []).filter((item) => !item.ok);
-    const verb = isUpload ? "上传" : (isLocal ? "从 A 删除" : "从 B 删除");
-    let text = (dry ? "[预演] " : "") + verb + "完成：" + done + " 项成功";
+    const verbs = {
+      upload: "上传",
+      "delete-local": "从 A 删除",
+      delete: "从 B 删除",
+      restore: "恢复",
+    };
+    let text = (dry ? "[预演] " : "") + verbs[kind] + "完成：" + done + " 项成功";
     if (failures.length) {
       text += "，" + failures.length + " 项失败：\n" + failures.slice(0, 5)
         .map((item) => "  " + item.path + " — " + item.error).join("\n");
@@ -1049,6 +1078,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
       text += "\n提示：B 已变化，基线已过期；可点“整类别备份到 B”或“重设基线”消除漂移。";
     } else if (isLocal && done && !dry) {
       text += "\n提示：这些文件现在只剩 B 里的一份，可随时恢复。";
+    } else if (isRestore && done && !dry) {
+      text += "\n提示：已写回 A，与 B 的当前版本一致。";
     }
     showMessage(failures.length ? "warn" : "ok", text);
     await loadDiff();
@@ -1095,6 +1126,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     $("upload-selected").addEventListener("click", () => run(() => operate("upload")));
     $("delete-selected").addEventListener("click", () => run(() => operate("delete")));
     $("delete-local-selected").addEventListener("click", () => run(() => operate("delete-local")));
+    $("restore-selected").addEventListener("click", () => run(() => operate("restore")));
     $("rebaseline").addEventListener("click", () => run(rebaseline));
     $("select-all").addEventListener("change", (event) => {
       const checked = event.target.checked;

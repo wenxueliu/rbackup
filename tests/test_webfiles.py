@@ -282,6 +282,66 @@ enabled = true
         self.assertEqual(result["failed"], 1, result)
         self.assertTrue(victim.exists())
 
+    # ---------- 恢复 B -> A ----------
+
+    def test_restore_missing_file(self) -> None:
+        (self.local / "a.txt").unlink()
+
+        result = webfiles.restore_paths(self.fresh_app(), "docs", ["a.txt"])
+        self.assertEqual(result["restored"], 1, result)
+        self.assertFalse(result["state_stale"])
+        self.assertEqual((self.local / "a.txt").read_bytes(), b"hello v1")
+
+    def test_restore_directory(self) -> None:
+        import shutil as _shutil
+
+        _shutil.rmtree(self.local / "sub")
+
+        result = webfiles.restore_paths(self.fresh_app(), "docs", ["sub"])
+        self.assertEqual(result["restored"], 1, result)
+        self.assertEqual((self.local / "sub" / "b.bin").read_bytes(), b"binary-v1")
+
+    def test_restore_refuses_existing_without_overwrite(self) -> None:
+        (self.local / "a.txt").write_bytes(b"local newer")
+        result = webfiles.restore_paths(self.fresh_app(), "docs", ["a.txt"])
+        self.assertEqual(result["restored"], 0)
+        self.assertEqual(result["failed"], 1)
+        self.assertIn("覆盖", result["results"][0]["error"])
+        self.assertEqual((self.local / "a.txt").read_bytes(), b"local newer")
+
+    def test_restore_overwrites_when_allowed(self) -> None:
+        (self.local / "a.txt").write_bytes(b"local newer")
+        result = webfiles.restore_paths(
+            self.fresh_app(), "docs", ["a.txt"], overwrite=True
+        )
+        self.assertEqual(result["restored"], 1, result)
+        self.assertEqual((self.local / "a.txt").read_bytes(), b"hello v1")
+
+    def test_restore_missing_remote_reports_error(self) -> None:
+        result = webfiles.restore_paths(self.fresh_app(), "docs", ["nope.txt"])
+        self.assertEqual(result["failed"], 1)
+        self.assertIn("不存在", result["results"][0]["error"])
+
+    def test_restore_dry_run_does_not_write(self) -> None:
+        (self.local / "a.txt").unlink()
+        result = webfiles.restore_paths(
+            self.fresh_app(), "docs", ["a.txt"], dry_run=True
+        )
+        self.assertEqual(result["restored"], 1)
+        self.assertTrue(result["dry_run"])
+        self.assertFalse((self.local / "a.txt").exists())
+
+    def test_restore_rejects_escape(self) -> None:
+        with self.assertRaises(UsageError):
+            webfiles.restore_paths(self.fresh_app(), "docs", ["../outside.txt"])
+
+    def test_restore_creates_parent_directories(self) -> None:
+        (self.local / "sub" / "b.bin").unlink()
+        (self.local / "sub").rmdir()
+        result = webfiles.restore_paths(self.fresh_app(), "docs", ["sub/b.bin"])
+        self.assertEqual(result["restored"], 1, result)
+        self.assertEqual((self.local / "sub" / "b.bin").read_bytes(), b"binary-v1")
+
     # ---------- 进度 ----------
 
     def test_upload_emits_progress_events(self) -> None:

@@ -151,6 +151,7 @@ class WebServerTests(unittest.TestCase):
             "/api/upload",
             "/api/delete",
             "/api/delete-local",
+            "/api/restore",
             "/api/rebaseline",
             "/api/backup",
         ):
