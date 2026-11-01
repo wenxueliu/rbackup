@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import traceback
 from pathlib import Path
 
 from . import __version__
+from . import audit
 from .app import App
 from .backup import run_backup
 from .config import default_config_path, init_config
@@ -19,6 +21,11 @@ from .status import run_status
 from .verify import run_verify
 from .versions import run_versions
 from .watch import run_watch
+from .webconfig import (
+    config_backup_dir,
+    list_config_backups,
+    restore_config_backup,
+)
 from .webui import run_web
 
 
@@ -150,6 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="允许覆盖已存在的目标")
     p.add_argument("--dry-run", action="store_true", help="只显示计划")
     p.add_argument("--json", action="store_true", dest="json_output")
+
+    p = _subparser(sub, "audit", "查看写操作的审计日志（删除/恢复/上传/保存配置）")
+    p.add_argument("--limit", type=int, default=50, help="最多显示多少条（默认 50）")
+    p.add_argument("--json", action="store_true", dest="json_output")
+
+    p = _subparser(sub, "config-backup", "查看或恢复配置文件的自动备份")
+    p.add_argument("--list", action="store_true", help="列出历史备份（默认动作）")
+    p.add_argument("--restore", metavar="文件名", help="用指定备份覆盖当前配置")
+    p.add_argument("--yes", action="store_true", help="恢复时不再询问")
+    p.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
@@ -208,6 +225,87 @@ def _init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_config_path(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser().resolve(strict=False)
+    return default_config_path().expanduser().resolve(strict=False)
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    path = _resolve_config_path(args.config)
+    entries = audit.read_entries(path, max(1, args.limit))
+    log_path = audit.audit_path(path)
+    if args.json_output:
+        print(json.dumps(
+            {"path": str(log_path), "entries": entries}, ensure_ascii=False
+        ))
+        return 0
+    if not entries:
+        print(f"还没有审计记录：{log_path}")
+        return 0
+    print(f"审计日志：{log_path}（最近 {len(entries)} 条）\n")
+    for entry in entries:
+        stamp = str(entry.get("ts", ""))[:19].replace("T", " ")
+        op = entry.get("op", "?")
+        scope = entry.get("category") or ",".join(entry.get("categories") or [])
+        count = entry.get("count")
+        result = (
+            "预演" if entry.get("dry_run")
+            else ("失败" if entry.get("ok") is False else ("部分失败" if entry.get("failed") else "成功"))
+        )
+        detail = []
+        if scope:
+            detail.append(str(scope))
+        if count is not None:
+            detail.append(f"{count} 项")
+        if entry.get("version"):
+            detail.append(f"版本 {entry['version']}")
+        if entry.get("error"):
+            detail.append(str(entry["error"]))
+        print(f"{stamp}  {op:<14} {result:<6} {' · '.join(detail)}")
+    return 0
+
+
+def _cmd_config_backup(args: argparse.Namespace) -> int:
+    path = _resolve_config_path(args.config)
+
+    if args.restore:
+        if not args.yes:
+            answer = input(f"用备份 {args.restore} 覆盖 {path}？[y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("已取消。")
+                return 1
+        source, safety = restore_config_backup(path, args.restore)
+        audit.record(
+            path,
+            "config.restore",
+            backup=source.name,
+            safety=str(safety) if safety else None,
+            actor="cli",
+        )
+        print(f"已恢复配置：{source}")
+        if safety:
+            print(f"覆盖前的配置备份：{safety}")
+        return 0
+
+    backups = list_config_backups(path)
+    if args.json_output:
+        print(json.dumps(
+            {"path": str(path), "dir": str(config_backup_dir(path)), "backups": backups},
+            ensure_ascii=False,
+        ))
+        return 0
+    if not backups:
+        print(f"还没有配置备份。每次保存配置会自动留一份，目录：{config_backup_dir(path)}")
+        return 0
+    print(f"配置备份目录：{config_backup_dir(path)}（共 {len(backups)} 份）\n")
+    for item in backups:
+        size_kb = max(1, round(item["size"] / 1024))
+        print(f"{item['mtime'][:19].replace('T', ' ')}  {size_kb:>4} KB  {item['name']}")
+    print(f"\n恢复某一份：rbackup config-backup --restore <文件名>")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
     parser = build_parser()
@@ -222,6 +320,11 @@ def main(argv: list[str] | None = None) -> int:
                 port=args.port,
                 open_browser=not args.no_browser,
             )
+        # 这两个命令只读本地文件，不需要解析出完整的备份配置
+        if args.command == "audit":
+            return _cmd_audit(args)
+        if args.command == "config-backup":
+            return _cmd_config_backup(args)
 
         app = App.create(
             args.config,
@@ -281,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "versions":
             return run_versions(app, args.category, json_output=args.json_output)
         if args.command == "prune":
-            return run_prune(
+            code = run_prune(
                 app,
                 keep=args.keep,
                 older_than_days=args.older_than_days,
@@ -289,8 +392,18 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 json_output=args.json_output,
             )
+            if not args.dry_run:
+                audit.record(
+                    app.config.path,
+                    "prune",
+                    actor="cli",
+                    keep=args.keep,
+                    older_than_days=args.older_than_days,
+                    ok=code == 0,
+                )
+            return code
         if args.command == "restore":
-            return run_restore(
+            code = run_restore(
                 app,
                 args.category,
                 args.remote_path,
@@ -300,6 +413,19 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 json_output=args.json_output,
             )
+            if not args.dry_run:
+                audit.record(
+                    app.config.path,
+                    "restore",
+                    actor="cli",
+                    category=args.category,
+                    items=[args.remote_path or "."],
+                    dest=args.dest,
+                    version=args.version_id,
+                    force=args.force,
+                    ok=code == 0,
+                )
+            return code
         raise UsageError(f"未知命令：{args.command}")
     except KeyboardInterrupt:
         print("\n已中断。", file=sys.stderr)

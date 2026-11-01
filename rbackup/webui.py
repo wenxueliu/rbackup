@@ -23,11 +23,14 @@ from .errors import ConfigError, RbackupError
 from .rclone import Rclone
 from .webconfig import (
     config_to_payload,
+    list_config_backups,
     normalize_payload,
     read_payload,
+    restore_config_backup as restore_backup_file,
     save_payload,
     validate_payload,
 )
+from . import audit
 from . import webfiles
 from .webpage import render_page
 
@@ -164,10 +167,50 @@ class WebState:
             self.payload = config_to_payload(config)
             self.exists = True
             self.load_error = None
+            audit.record(
+                self.config_path,
+                "config.save",
+                device=config.device,
+                remote=config.remote,
+                categories=sorted(config.categories),
+                backup=str(backup) if backup else None,
+            )
             result = self.snapshot()
             result.update(
                 {
                     "backup": str(backup) if backup else None,
+                    "backups": len(list_config_backups(self.config_path)),
+                }
+            )
+            return result
+
+    def config_backups(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "path": str(self.config_path),
+            "audit_log": str(audit.audit_path(self.config_path)),
+            "backups": list_config_backups(self.config_path),
+        }
+
+    def restore_config_backup(self, name: Any, confirm: Any = False) -> dict[str, Any]:
+        if not _flag(confirm):
+            raise ConfigError("恢复配置备份需要显式确认（confirm=true）")
+        with self.lock:
+            source, safety = restore_backup_file(
+                self.config_path, str(name or "")
+            )
+            self.payload, self.exists, self.load_error = read_payload(self.config_path)
+            audit.record(
+                self.config_path,
+                "config.restore",
+                backup=source.name,
+                safety=str(safety) if safety else None,
+            )
+            result = self.snapshot()
+            result.update(
+                {
+                    "restored": source.name,
+                    "safety": str(safety) if safety else None,
                 }
             )
             return result
@@ -241,6 +284,18 @@ class WebState:
     def _app(self, payload: dict[str, Any]) -> App:
         return webfiles.app_from_payload(payload, self.config_path)
 
+    def _audit(self, op: str, *, app: App | None = None, **fields: Any) -> None:
+        """记录一次写操作。字段为空（None）时自动省略。"""
+        items = fields.pop("items", None)
+        audit.record(
+            self.config_path,
+            op,
+            items=items if isinstance(items, (list, tuple)) else None,
+            device=app.layout.device if app else None,
+            remote=app.layout.remote if app else None,
+            **fields,
+        )
+
     def diff(self, payload: dict[str, Any], names: Any = None) -> dict[str, Any]:
         return webfiles.compute_diff(self._app(payload), _name_list(names))
 
@@ -249,6 +304,7 @@ class WebState:
     ) -> dict[str, Any]:
         app = self._app(payload)
         name = _category_name(category)
+        dry = _flag(dry_run)
         with self.mutation_lock:
             self._progress_begin("upload", f"上传到 B · {name}")
             failure: str | None = None
@@ -257,15 +313,24 @@ class WebState:
                     app,
                     name,
                     paths,
-                    dry_run=_flag(dry_run),
+                    dry_run=dry,
                     on_progress=self._progress_event,
                 )
             except RbackupError as exc:
                 failure = str(exc)
+                self._audit(
+                    "upload", app=app, category=name, items=paths,
+                    dry_run=dry, ok=False, error=str(exc)[:500],
+                )
                 raise
             else:
                 if result.get("failed"):
                     failure = f"{result['failed']} 项失败，详见结果"
+                self._audit(
+                    "upload", app=app, category=name, items=paths, dry_run=dry,
+                    uploaded=result.get("uploaded"), failed=result.get("failed"),
+                    version=result.get("version_id"),
+                )
                 return result
             finally:
                 self._progress_end(failure)
@@ -274,19 +339,43 @@ class WebState:
         self, payload: dict[str, Any], category: Any, paths: Any, dry_run: Any = False
     ) -> dict[str, Any]:
         app = self._app(payload)
+        name = _category_name(category)
+        dry = _flag(dry_run)
         with self.mutation_lock:
-            return webfiles.delete_paths(
-                app, _category_name(category), paths, dry_run=_flag(dry_run)
+            try:
+                result = webfiles.delete_paths(app, name, paths, dry_run=dry)
+            except RbackupError as exc:
+                self._audit(
+                    "delete", app=app, category=name, items=paths,
+                    dry_run=dry, ok=False, error=str(exc)[:500],
+                )
+                raise
+            self._audit(
+                "delete", app=app, category=name, items=paths, dry_run=dry,
+                deleted=result.get("deleted"), failed=result.get("failed"),
             )
+            return result
 
     def remove_local(
         self, payload: dict[str, Any], category: Any, paths: Any, dry_run: Any = False
     ) -> dict[str, Any]:
         app = self._app(payload)
+        name = _category_name(category)
+        dry = _flag(dry_run)
         with self.mutation_lock:
-            return webfiles.delete_local_paths(
-                app, _category_name(category), paths, dry_run=_flag(dry_run)
+            try:
+                result = webfiles.delete_local_paths(app, name, paths, dry_run=dry)
+            except RbackupError as exc:
+                self._audit(
+                    "delete-local", app=app, category=name, items=paths,
+                    dry_run=dry, ok=False, error=str(exc)[:500],
+                )
+                raise
+            self._audit(
+                "delete-local", app=app, category=name, items=paths, dry_run=dry,
+                deleted=result.get("deleted"), failed=result.get("failed"),
             )
+            return result
 
     def restore(
         self,
@@ -298,6 +387,8 @@ class WebState:
     ) -> dict[str, Any]:
         app = self._app(payload)
         name = _category_name(category)
+        dry = _flag(dry_run)
+        allow = _flag(overwrite)
         with self.mutation_lock:
             self._progress_begin("restore", f"恢复到 A · {name}")
             failure: str | None = None
@@ -306,16 +397,25 @@ class WebState:
                     app,
                     name,
                     paths,
-                    dry_run=_flag(dry_run),
-                    overwrite=_flag(overwrite),
+                    dry_run=dry,
+                    overwrite=allow,
                     on_progress=self._progress_event,
                 )
             except RbackupError as exc:
                 failure = str(exc)
+                self._audit(
+                    "restore", app=app, category=name, items=paths,
+                    dry_run=dry, overwrite=allow, ok=False, error=str(exc)[:500],
+                )
                 raise
             else:
                 if result.get("failed"):
                     failure = f"{result['failed']} 项失败，详见结果"
+                self._audit(
+                    "restore", app=app, category=name, items=paths, dry_run=dry,
+                    overwrite=allow, restored=result.get("restored"),
+                    failed=result.get("failed"),
+                )
                 return result
             finally:
                 self._progress_end(failure)
@@ -323,7 +423,11 @@ class WebState:
     def rebaseline(self, payload: dict[str, Any], names: Any = None) -> dict[str, Any]:
         app = self._app(payload)
         with self.mutation_lock:
-            return webfiles.rebaseline(app, _name_list(names))
+            result = webfiles.rebaseline(app, _name_list(names))
+            self._audit(
+                "rebaseline", app=app, categories=result.get("updated"), counts=result.get("counts")
+            )
+            return result
 
     def backup_now(
         self, payload: dict[str, Any], names: Any = None, force: Any = False
@@ -336,6 +440,17 @@ class WebState:
                 force=_flag(force),
                 json_output=False,
             )
+        exit_code = int(summary["exit_code"])
+        self._audit(
+            "backup",
+            app=app,
+            categories=sorted(summary.get("categories") or {}),
+            force=_flag(force),
+            ok=exit_code == 0,
+            exit_code=exit_code,
+            version=summary.get("version_id"),
+            failures=summary.get("failures"),
+        )
         exit_code = int(summary["exit_code"])
         result: dict[str, Any] = {
             "ok": exit_code == 0,
@@ -486,6 +601,29 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                     return
                 self._send_json(200, state.progress_snapshot())
                 return
+            if parsed.path == "/api/config-backups":
+                if not self._auth():
+                    return
+                self._send_json(200, state.config_backups())
+                return
+            if parsed.path == "/api/audit":
+                if not self._auth():
+                    return
+                query = parse_qs(parsed.query)
+                limit = query.get("limit", ["50"])[0]
+                try:
+                    count = max(1, min(1000, int(limit)))
+                except ValueError:
+                    count = 50
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "path": str(audit.audit_path(state.config_path)),
+                        "entries": audit.read_entries(state.config_path, count),
+                    },
+                )
+                return
             self._send_json(404, {"ok": False, "error": "not found"})
 
         def _read_json(self) -> dict[str, Any] | None:
@@ -558,6 +696,14 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/reload":
                     self._send_json(200, state.reload())
+                    return
+                if parsed.path == "/api/config-restore":
+                    self._send_json(
+                        200,
+                        state.restore_config_backup(
+                            body.get("name"), body.get("confirm", False)
+                        ),
+                    )
                     return
                 if parsed.path == "/api/diff":
                     self._send_json(

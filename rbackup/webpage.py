@@ -339,6 +339,24 @@ PAGE_TEMPLATE = r"""<!doctype html>
     <div id="diff-body"></div>
   </section>
 
+  <section id="audit" class="card">
+    <div class="section-head">
+      <div>
+        <h2>最近操作</h2>
+        <p>
+          删除、恢复、上传、重设基线和保存配置都会追加一条审计日志，
+          便于事后定位谁在什么时候动了哪些文件。
+        </p>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button id="load-audit" type="button" class="small">刷新</button>
+      <button id="load-backups" type="button" class="small">查看配置备份</button>
+      <span id="audit-path" class="tiny muted"></span>
+    </div>
+    <div id="audit-body"></div>
+  </section>
+
   <section id="result" class="card" hidden>
     <h2>检查结果</h2>
     <p class="sub" id="result-summary"></p>
@@ -409,7 +427,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     ["reload", "check", "save", "refresh-remotes", "inspect-remote", "add-category",
      "load-diff", "run-backup", "upload-selected", "delete-selected",
      "delete-local-selected", "restore-selected", "overwrite-restore",
-     "rebaseline", "force-backup"].forEach((id) => {
+     "load-audit", "load-backups", "rebaseline", "force-backup"].forEach((id) => {
       const el = $(id);
       if (el) el.disabled = value;
     });
@@ -671,7 +689,12 @@ PAGE_TEMPLATE = r"""<!doctype html>
     $("config-exists").textContent = "已保存";
     setDirty(false);
     if (data.payload) fill(data.payload);
-    showMessage("ok", "配置已保存。" + (data.backup ? " 旧配置备份：" + data.backup : ""));
+    const backupNote = data.backup
+      ? " 旧配置已备份：" + data.backup +
+        (data.backups != null ? "（共 " + data.backups + " 份历史备份）" : "")
+      : "";
+    showMessage("ok", "配置已保存。" + backupNote);
+    await loadAudit();
     try { await inspectRemote(false); } catch (_) { clearBInfo(); }
   }
 
@@ -996,6 +1019,158 @@ PAGE_TEMPLATE = r"""<!doctype html>
     }
   }
 
+  // ---------- 审计日志 / 配置备份 ----------
+  const OP_LABELS = {
+    upload: "上传到 B",
+    delete: "从 B 删除",
+    "delete-local": "从 A 删除",
+    restore: "恢复到 A",
+    rebaseline: "重设基线",
+    backup: "整类别备份",
+    "config.save": "保存配置",
+    "config.restore": "恢复配置备份",
+  };
+
+  function auditTime(ts) {
+    const text = String(ts || "");
+    const match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+    return match
+      ? match[2] + "-" + match[3] + " " + match[4] + ":" + match[5] + ":" + match[6]
+      : text;
+  }
+
+  function auditResult(entry) {
+    if (entry.dry_run) return "预演";
+    if (entry.ok === false) return "失败";
+    if (entry.failed) return "部分失败";
+    return "成功";
+  }
+
+  function makeCell(tag, text, className) {
+    const el = document.createElement(tag);
+    if (text !== undefined && text !== null && text !== "") el.textContent = String(text);
+    if (className) el.className = className;
+    return el;
+  }
+
+  function makeTable(titles, rows) {
+    const table = document.createElement("table");
+    table.className = "difftable";
+    const head = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    titles.forEach((titleText, index) => {
+      const th = makeCell("th", titleText);
+      if (index === 0) th.style.width = "120px";
+      headRow.appendChild(th);
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+    const body = document.createElement("tbody");
+    rows.forEach((cells) => {
+      const row = document.createElement("tr");
+      cells.forEach((item) => {
+        if (item instanceof Element) row.appendChild(item);
+        else row.appendChild(makeCell("td", item));
+      });
+      body.appendChild(row);
+    });
+    table.appendChild(body);
+    return table;
+  }
+
+  function emptyBox(text) {
+    const box = document.createElement("div");
+    box.className = "empty";
+    box.textContent = text;
+    return box;
+  }
+
+  async function loadAudit() {
+    let data;
+    try {
+      data = await api("/api/audit?limit=50", { method: "GET" });
+    } catch (err) {
+      $("audit-body").textContent = "读取审计日志失败：" + err.message;
+      return;
+    }
+    $("audit-path").textContent = "日志文件：" + (data.path || "");
+    const entries = (data.entries || []).slice().reverse();
+    const box = $("audit-body");
+    box.textContent = "";
+    if (!entries.length) {
+      box.appendChild(emptyBox("还没有记录。执行一次上传、删除、恢复或保存配置后会出现。"));
+      return;
+    }
+    const rows = entries.map((entry) => {
+      const scope = entry.category || (entry.categories || []).join(", ");
+      const detail = [];
+      if (entry.overwrite) detail.push("覆盖");
+      if (entry.force) detail.push("--force");
+      if (entry.version) detail.push("版本 " + entry.version);
+      if (entry.error) detail.push(entry.error);
+      return [
+        makeCell("td", auditTime(entry.ts), "num"),
+        makeCell("td", OP_LABELS[entry.op] || entry.op),
+        makeCell("td", scope, "path"),
+        makeCell("td", entry.count != null ? entry.count : "", "num"),
+        makeCell("td", auditResult(entry), "num"),
+        makeCell("td", detail.join(" · "), "num"),
+      ];
+    });
+    box.appendChild(makeTable(["时间", "操作", "类别", "项数", "结果", "详情"], rows));
+  }
+
+  async function restoreConfigBackup(name) {
+    if (!confirm("用备份 " + name + " 覆盖当前配置？\n\n覆盖前的配置会另存为 .bak，不会丢。")) return;
+    try {
+      await api("/api/config-restore", {
+        method: "POST",
+        body: JSON.stringify({ name: name, confirm: true }),
+      });
+    } catch (err) {
+      showMessage("err", "恢复配置失败：" + err.message);
+      return;
+    }
+    showMessage("ok", "已恢复配置：" + name);
+    await loadConfig();
+    await loadAudit();
+  }
+
+  async function loadBackups() {
+    let data;
+    try {
+      data = await api("/api/config-backups", { method: "GET" });
+    } catch (err) {
+      $("audit-body").textContent = "读取配置备份失败：" + err.message;
+      return;
+    }
+    const backups = data.backups || [];
+    $("audit-path").textContent =
+      "备份目录：" + (data.path || "") + "（共 " + backups.length + " 份）";
+    const box = $("audit-body");
+    box.textContent = "";
+    if (!backups.length) {
+      box.appendChild(emptyBox("还没有配置备份。每次在页面保存配置都会自动留一份，最多保留 20 份。"));
+      return;
+    }
+    const rows = backups.map((item) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "small";
+      button.textContent = "恢复";
+      button.addEventListener("click", () => restoreConfigBackup(item.name));
+      const actionCell = makeCell("td", "");
+      actionCell.appendChild(button);
+      return [
+        makeCell("td", item.name, "path"),
+        makeCell("td", item.mtime.replace("T", " ").slice(0, 19), "num"),
+        makeCell("td", formatSize(item.size), "num"),
+        actionCell,
+      ];
+    });
+    box.appendChild(makeTable(["备份文件", "时间", "大小", "操作"], rows));
+  }
+
   async function operate(kind) {
     const category = $("browse-category").value;
     if (!category) {
@@ -1030,6 +1205,18 @@ PAGE_TEMPLATE = r"""<!doctype html>
           "删除会随网盘客户端同步到云端，且不会进入 _versions。";
       }
       if (!confirm(message)) return;
+
+      // 删除是不可逆的，再要一次显式确认：必须手打“删除”两个字
+      if (isLocal || kind === "delete") {
+        const typed = prompt(
+          "二次确认：这是不可恢复的操作。\n" +
+          "如果确实要删除上面 " + rows.length + " 项，请输入「删除」两个字，其它输入将取消。"
+        );
+        if (typed !== "删除") {
+          showMessage("warn", "已取消：二次确认未通过（需要输入「删除」）。");
+          return;
+        }
+      }
     }
 
     const endpoints = {
@@ -1083,6 +1270,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
     }
     showMessage(failures.length ? "warn" : "ok", text);
     await loadDiff();
+    await loadAudit();
   }
 
   async function backupCategory() {
@@ -1127,6 +1315,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
     $("delete-selected").addEventListener("click", () => run(() => operate("delete")));
     $("delete-local-selected").addEventListener("click", () => run(() => operate("delete-local")));
     $("restore-selected").addEventListener("click", () => run(() => operate("restore")));
+    $("load-audit").addEventListener("click", () => run(loadAudit));
+    $("load-backups").addEventListener("click", () => run(loadBackups));
     $("rebaseline").addEventListener("click", () => run(rebaseline));
     $("select-all").addEventListener("change", (event) => {
       const checked = event.target.checked;
@@ -1187,6 +1377,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
       } catch (_) {
         // rclone 还没配置好时，检查/保存仍可用。
       }
+      await loadAudit();
     });
   });
 })();

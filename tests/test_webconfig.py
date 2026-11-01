@@ -7,11 +7,15 @@ from pathlib import Path
 from rbackup.config import load_config
 from rbackup.errors import ConfigError
 from rbackup.webconfig import (
+    CONFIG_BACKUP_KEEP,
+    config_backup_dir,
     config_to_payload,
     default_payload,
+    list_config_backups,
     normalize_payload,
     payload_to_toml,
     read_payload,
+    restore_config_backup,
     save_payload,
     validate_payload,
 )
@@ -102,6 +106,84 @@ class WebConfigTests(unittest.TestCase):
         self.assertTrue(exists)
         self.assertIsNotNone(error)
         self.assertIn("categories", payload)
+
+    # ---------- 配置历史备份 ----------
+
+    def _payload(self, device: str):
+        payload = default_payload()
+        payload["device"] = device
+        payload["categories"] = [
+            {
+                "name": "docs",
+                "path": (self.root / "docs").as_posix(),
+                "excludes": [],
+                "enabled": True,
+            }
+        ]
+        return payload
+
+    def test_save_creates_history_backup(self) -> None:
+        save_payload(self._payload("one"), self.config)
+        self.assertEqual(list_config_backups(self.config), [])
+
+        _saved, history = save_payload(self._payload("two"), self.config)
+        self.assertIsNotNone(history)
+        assert history is not None
+        self.assertTrue(history.exists())
+        self.assertEqual(history.parent, config_backup_dir(self.config))
+        self.assertEqual(load_config(str(history)).device, "one")
+
+        backups = list_config_backups(self.config)
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0]["name"], history.name)
+
+    def test_history_keeps_only_latest(self) -> None:
+        save_payload(self._payload("v0"), self.config)
+        for index in range(1, CONFIG_BACKUP_KEEP + 6):
+            save_payload(self._payload(f"v{index}"), self.config)
+        backups = list_config_backups(self.config)
+        self.assertEqual(len(backups), CONFIG_BACKUP_KEEP)
+
+    def test_list_is_newest_first(self) -> None:
+        save_payload(self._payload("v0"), self.config)
+        for index in range(1, 4):
+            save_payload(self._payload(f"v{index}"), self.config)
+        backups = list_config_backups(self.config)
+        self.assertEqual(len(backups), 3)
+        self.assertGreaterEqual(backups[0]["mtime"], backups[-1]["mtime"])
+
+    def test_restore_history_backup(self) -> None:
+        save_payload(self._payload("原始"), self.config)
+        save_payload(self._payload("改过的"), self.config)
+        self.assertEqual(load_config(str(self.config)).device, "改过的")
+
+        backups = list_config_backups(self.config)
+        source, safety = restore_config_backup(self.config, backups[0]["name"])
+        self.assertTrue(source.exists())
+        self.assertIsNotNone(safety)
+        self.assertEqual(load_config(str(self.config)).device, "原始")
+        # 覆盖前的配置被保住
+        assert safety is not None
+        self.assertEqual(load_config(str(safety)).device, "改过的")
+
+    def test_restore_rejects_path_traversal(self) -> None:
+        save_payload(self._payload("x"), self.config)
+        with self.assertRaises(ConfigError):
+            restore_config_backup(self.config, "../rbackup.toml")
+        with self.assertRaises(ConfigError):
+            restore_config_backup(self.config, "missing.toml")
+
+    def test_restore_rejects_invalid_backup(self) -> None:
+        save_payload(self._payload("x"), self.config)
+        directory = config_backup_dir(self.config)
+        directory.mkdir(parents=True, exist_ok=True)
+        broken = directory / "broken.toml"
+        broken.write_text("not = [valid", encoding="utf-8")
+        with self.assertRaises(ConfigError) as ctx:
+            restore_config_backup(self.config, broken.name)
+        self.assertIn("无法解析", str(ctx.exception))
+        # 当前配置没被破坏
+        self.assertEqual(load_config(str(self.config)).device, "x")
 
 
 if __name__ == "__main__":

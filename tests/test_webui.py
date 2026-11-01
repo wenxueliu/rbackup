@@ -175,6 +175,29 @@ class WebServerTests(unittest.TestCase):
         status, _body, _content_type = self.request("/api/progress", method="GET")
         self.assertEqual(status, 403)
 
+    def test_audit_endpoint_returns_entries(self) -> None:
+        status, body, _content_type = self.request(
+            "/api/audit?limit=10", method="GET", token=self.token
+        )
+        self.assertEqual(status, 200, body)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertIsInstance(data["entries"], list)
+        self.assertTrue(data["path"].endswith(".audit.log"))
+
+    def test_audit_endpoint_requires_token(self) -> None:
+        status, _body, _content_type = self.request("/api/audit", method="GET")
+        self.assertEqual(status, 403)
+
+    def test_config_backups_endpoint(self) -> None:
+        status, body, _content_type = self.request(
+            "/api/config-backups", method="GET", token=self.token
+        )
+        self.assertEqual(status, 200, body)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertIsInstance(data["backups"], list)
+
 
 if __name__ == "__main__":
     unittest.main()
