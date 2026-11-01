@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.tools/
+.test-tmp/
+.kimi-test/
+*.egg-info/
+build/
+dist/
+
+# 本地 rclone 二进制（约 81MB，不入库）
+rclone.exe
+rclone.conf
+
+# 排障产生的脚本与日志
+diag-rclone-block.*
+
+# 配置备份
+*.bak

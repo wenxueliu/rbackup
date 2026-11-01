@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rbackup"
+version = "0.1.0"
+description = "Per-device, encrypted, versioned rclone backups without local indexes"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "rbackup" }]
+dependencies = []
+
+[project.scripts]
+rbackup = "rbackup.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rbackup*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

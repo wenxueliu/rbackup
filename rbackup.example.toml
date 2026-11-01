@@ -1,0 +1,47 @@
+# rbackup 示例配置。复制为 rbackup.toml 后修改。
+# 一台设备一个 device；两台设备绝不能共用同一个 device 前缀。
+
+device = "my-laptop"
+
+# B 是本地同步目录时，remote 填一个“底层指向 B”的 crypt remote。
+# 先创建 rclone crypt remote（名称示例 b_crypt）：
+#   rclone config
+#   n -> b_crypt -> crypt
+#   remote = D:/QuarkSync/rbackup       # 你的 B 目录
+#   filename_encryption = standard
+#   directory_name_encryption = true
+# 然后让网盘同步客户端把 D:/QuarkSync/rbackup 同步到云端。
+remote = "b_crypt"
+
+# rclone 可执行文件。留空/不写则从 PATH 查找。
+rclone_bin = "rclone"
+# 可选：显式指定 rclone.conf。不写则使用 rclone 默认配置路径。
+# rclone_config = "C:/Users/you/.config/rclone/rclone.conf"
+
+# watch 轮询间隔（秒）。B 在本地，2-5 秒即可获得接近实时的感知。
+poll_interval = 5
+transfers = 4
+checkers = 8
+retries = 3
+# 限速示例：上传 8 MiB/s，下载不限。
+# bwlimit = "8M:off"
+
+# 云端布局。状态和版本也写在 B 内，并随 B 同步到网盘。
+state_prefix = "_state"
+versions_prefix = "_versions"
+
+# 默认不跟随符号链接；rclone 会把它保存成可还原的 .rclonelink 小文件。
+follow_symlinks = false
+create_empty_dirs = true
+keep_versions = 30
+
+[categories.documents]
+path = "~/Documents"
+excludes = ["**/.git/**", "**/node_modules/**", "**/.DS_Store"]
+enabled = true
+
+# 可配置多个类别；每个类别对应 B 内的 <device>/<类别名>/。
+# [categories.photos]
+# path = "D:/Photos"
+# excludes = ["**/Thumbs.db"]
+# enabled = true
