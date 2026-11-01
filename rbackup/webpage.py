@@ -167,6 +167,8 @@ PAGE_TEMPLATE = r"""<!doctype html>
   @keyframes progress-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
   .progress-fill.failed { background: var(--err); }
   .progress-detail { margin-top: 7px; font-variant-numeric: tabular-nums; }
+  .filterbar { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin: 0 0 14px; padding: 9px 13px; background: var(--soft); border: 1px solid var(--line); border-radius: 11px; }
+  .filterbar select { padding: 4px 8px; margin-left: 6px; }
   .result-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--muted); }
   @media (max-width: 780px) {
     .hero { display: block; }
@@ -311,8 +313,34 @@ PAGE_TEMPLATE = r"""<!doctype html>
       <button id="load-diff" type="button" class="primary">对比</button>
       <button id="run-backup" type="button">整类别备份到 B</button>
       <label class="checkline"><input id="force-backup" type="checkbox"> 覆盖远端漂移</label>
-      <label class="checkline"><input id="only-diff" type="checkbox" checked> 只看差异</label>
       <label class="checkline"><input id="dry-run" type="checkbox"> 仅预演</label>
+    </div>
+    <div class="filterbar" id="diff-filters" hidden>
+      <label class="checkline">状态
+        <select id="filter-state">
+          <option value="diff" selected>只看差异</option>
+          <option value="all">全部</option>
+          <option value="same">一致</option>
+          <option value="modified">大小/时间不同</option>
+          <option value="local">只在 A</option>
+          <option value="remote">只在 B</option>
+        </select>
+      </label>
+      <label class="checkline">A 列
+        <select id="filter-a">
+          <option value="all" selected>全部</option>
+          <option value="yes">有</option>
+          <option value="no">无</option>
+        </select>
+      </label>
+      <label class="checkline">B 列
+        <select id="filter-b">
+          <option value="all" selected>全部</option>
+          <option value="yes">有</option>
+          <option value="no">无</option>
+        </select>
+      </label>
+      <span id="filter-summary" class="tiny muted"></span>
     </div>
     <div id="diff-summary" class="tiny muted" style="margin-bottom:12px">尚未对比。</div>
     <div id="progress" class="progress" hidden>
@@ -325,7 +353,7 @@ PAGE_TEMPLATE = r"""<!doctype html>
       </div>
       <div id="progress-detail" class="tiny muted"></div>
     </div>
-    <div class="toolbar" id="diff-toolbar" hidden>
+    <div id="diff-toolbar" class="toolbar" hidden>
       <label class="checkline"><input id="select-all" type="checkbox"> 全选</label>
       <span id="selection-count" class="tiny muted">已选 0 项</span>
       <span class="grow"></span>
@@ -861,12 +889,66 @@ PAGE_TEMPLATE = r"""<!doctype html>
     return parts.join(" · ") + (data.truncated ? "（结果已截断，只显示部分）" : "");
   }
 
+  // 状态 / A 列 / B 列过滤
+  function filterValues() {
+    return {
+      state: $("filter-state").value,
+      a: $("filter-a").value,
+      b: $("filter-b").value,
+    };
+  }
+
+  function itemSides(kind, item) {
+    if (kind === "dir") return { inA: !!item.in_a, inB: !!item.in_b };
+    // 目的独有说明 A 没有；源独有说明 B 没有
+    return {
+      inA: item.state !== "remote_only",
+      inB: item.state !== "local_only",
+    };
+  }
+
+  function sideMatches(present, want) {
+    if (want === "yes") return present;
+    if (want === "no") return !present;
+    return true;
+  }
+
+  function keepItem(kind, item, filters) {
+    const sides = itemSides(kind, item);
+    if (!sideMatches(sides.inA, filters.a)) return false;
+    if (!sideMatches(sides.inB, filters.b)) return false;
+    const state = kind === "dir" ? dirState(item) : item.state;
+    if (filters.state === "diff") {
+      return state !== "both" && state !== "same";
+    }
+    if (filters.state === "same") {
+      return state === "both" || state === "same";
+    }
+    if (filters.state === "modified") {
+      return state === "modified";
+    }
+    if (filters.state === "local") {
+      return state === "local" || state === "local_only";
+    }
+    if (filters.state === "remote") {
+      return state === "remote" || state === "remote_only";
+    }
+    return true;
+  }
+
+  function countLabel(shown, total) {
+    return shown === total ? String(total) : shown + " / " + total;
+  }
+
   function renderDiff(data) {
     const host = $("diff-body");
     host.replaceChildren();
     $("diff-summary").textContent = summarizeDiff(data);
     $("diff-toolbar").hidden = false;
-    const onlyDiff = $("only-diff").checked;
+    $("diff-filters").hidden = false;
+    const filters = filterValues();
+    let shownTotal = 0;
+    let allTotal = 0;
 
     (data.categories || []).forEach((cat) => {
       const block = document.createElement("div");
@@ -889,31 +971,41 @@ PAGE_TEMPLATE = r"""<!doctype html>
         block.appendChild(warn);
       }
 
-      const dirs = (cat.dirs || []).filter((item) => !onlyDiff || dirState(item) !== "both");
-      const files = (cat.files || []).filter((item) => !onlyDiff || item.state !== "same");
+      const allDirs = cat.dirs || [];
+      const allFiles = cat.files || [];
+      const dirs = allDirs.filter((item) => keepItem("dir", item, filters));
+      const files = allFiles.filter((item) => keepItem("file", item, filters));
+      shownTotal += dirs.length + files.length;
+      allTotal += allDirs.length + allFiles.length;
 
       if (!dirs.length && !files.length) {
         const empty = document.createElement("div");
         empty.className = "empty";
-        empty.textContent = onlyDiff ? "没有差异。" : "没有内容。";
+        empty.textContent = allDirs.length || allFiles.length
+          ? "没有符合过滤条件的内容。"
+          : "没有内容。";
         block.appendChild(empty);
       }
       if (dirs.length) {
         const title = document.createElement("div");
         title.className = "group-title";
-        title.textContent = "文件夹 " + dirs.length;
+        title.textContent = "文件夹 " + countLabel(dirs.length, allDirs.length);
         block.appendChild(title);
         block.appendChild(makeTable("dir", dirs));
       }
       if (files.length) {
         const title = document.createElement("div");
         title.className = "group-title";
-        title.textContent = "文件 " + files.length;
+        title.textContent = "文件 " + countLabel(files.length, allFiles.length);
         block.appendChild(title);
         block.appendChild(makeTable("file", files));
       }
       host.appendChild(block);
     });
+
+    $("filter-summary").textContent = shownTotal === allTotal
+      ? "共 " + allTotal + " 项"
+      : "显示 " + shownTotal + " / " + allTotal + " 项";
     updateSelection();
   }
 
@@ -1325,13 +1417,16 @@ PAGE_TEMPLATE = r"""<!doctype html>
       document.querySelectorAll(".row-check").forEach((box) => { box.checked = checked; });
       updateSelection();
     });
-    $("only-diff").addEventListener("change", () => {
-      if (diffData) renderDiff(diffData);
+    ["filter-state", "filter-a", "filter-b"].forEach((id) => {
+      $(id).addEventListener("change", () => {
+        if (diffData) renderDiff(diffData);
+      });
     });
     $("browse-category").addEventListener("change", () => {
       diffData = null;
       $("diff-body").replaceChildren();
       $("diff-toolbar").hidden = true;
+      $("diff-filters").hidden = true;
       $("diff-summary").textContent = "已切换类别，请重新对比。";
     });
     $("add-category").addEventListener("click", addCategory);
